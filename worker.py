@@ -3,16 +3,20 @@
 """
 F4CK CHEAT — GitHub Actions 10-Gbps + TeleCloud-Go 9-AuthKey Work-Stealing Worker
 - Drains VPS FIFO Queue (__gh_next_job__.json)
+- Zero-install boot: pre-bundled static binaries + pure-Python deps in /usr/local/lib/f4ck_pydeps
 - Uses /usr/local/bin/f4ck-telecloud-up (Go gotd/td 9-AuthKey Work-Stealing Pool) over Azure 10-Gbps NIC (80-150+ MB/s into Telegram)
 - Parallel GitHub Releases 10-Gbps CDN upload (200-400 MB/s)
-- Auto-exits after 90s of idle time so GitHub never flags the account for long-running jobs
+- Auto-exits after 180s of idle time so GitHub never flags the account for long-running jobs
 - Replies directly to reply_to_mid for every finished link
 """
 
 from __future__ import annotations
 
+import sys
+sys.path.insert(0, "/usr/local/lib/f4ck_pydeps")
+
 import asyncio
-import hashlib
+import base64
 import html
 import json
 import os
@@ -41,7 +45,6 @@ RELEASE_TAG = "v1.0.0"
 VPS_BASE = "https://160-191-242-70.sslip.io"
 DL_SECRET = "f4ck_unfairplay_dl_secret_2026"
 VPS_POP_URL = f"{VPS_BASE}/dl_dec/gh_warm_pop/{DL_SECRET}/__gh_next_job__.json"
-VPS_REG_URL = f"{VPS_BASE}/dl_dec/telecloud_reg/{DL_SECRET}/register.json"
 
 MAX_PART_SIZE = 1950 * 1024 * 1024
 TG_API_ID = 2040
@@ -68,6 +71,14 @@ def format_bytes(num: int) -> str:
 def sanitize_filename(name: str, fallback: str = "Game") -> str:
     s = re.sub(r"[^\w\-.]+", "_", str(name or "").strip(), flags=re.UNICODE).strip("._")
     return s[:80] or fallback
+
+
+def _notify_vps_job_done(payload: Dict[str, Any]) -> None:
+    try:
+        b64 = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).decode("ascii").rstrip("=")
+        _http_sess.get(f"{VPS_BASE}/dl_dec/telecloud_reg/{DL_SECRET}/{b64}", timeout=10)
+    except Exception:
+        pass
 
 
 def _tg_edit(bot_token: str, chat_id: Any, message_id: Optional[int], text: str, reply_markup: Optional[dict] = None) -> None:
@@ -150,9 +161,11 @@ def upload_via_telecloud_go_10gbps(
     bot_token: str,
     chat_id: int,
     ipa_path: Path,
-    caption: str,
+    caption_base: str,
     status_mid: Optional[int],
-    reply_markup: Optional[dict],
+    dl_url_fallback: str,
+    gh_cdn_holder: List[Optional[str]],
+    gh_thread: threading.Thread,
     reply_to_mid: Optional[int],
 ) -> bool:
     from telethon import TelegramClient
@@ -216,13 +229,13 @@ def upload_via_telecloud_go_10gbps(
                         pct = min(99.9, (cur_total * 100.0 / total_sz) if total_sz > 0 else 0.0)
                         part_label = f" — Phần {part_idx + 1}/{num_parts}" if num_parts > 1 else ""
                         msg_txt = (
-                            caption
+                            caption_base
                             + f"\n\n<b>[3/3] Đang bắn IPA vào Telegram (GitHub 10-Gbps + TeleCloud-Go{part_label}):</b> "
                             + f"<b>{pct:.1f}%</b> (<code>{format_bytes(cur_total)} / {format_bytes(total_sz)}</code> — <code>{speed_mb:.1f} MB/s</code>)"
                         )
                         threading.Thread(
                             target=_tg_edit,
-                            args=(bot_token, chat_id, status_mid, msg_txt, reply_markup),
+                            args=(bot_token, chat_id, status_mid, msg_txt, None),
                             daemon=True,
                         ).start()
 
@@ -231,6 +244,19 @@ def upload_via_telecloud_go_10gbps(
             return False
         sent_bytes_completed += part_sz
 
+        # By the time f4ck-telecloud-up finishes, the parallel GitHub Release CDN upload is usually done too!
+        gh_thread.join(timeout=2.5)
+        final_dl_url = gh_cdn_holder[0] or dl_url_fallback
+        reply_markup = (
+            {"inline_keyboard": [[{"text": f"Tải Trực Tiếp IPA ({format_bytes(total_sz)} - Max Speed)", "url": final_dl_url}]]}
+            if final_dl_url
+            else None
+        )
+        caption = caption_base + (
+            f"\n• <b>Link tải 1 file IPA duy nhất:</b> <a href=\"{html.escape(final_dl_url)}\">Bấm vào đây để tải IPA ngay</a>"
+            if final_dl_url
+            else ""
+        )
         part_caption = (
             f"<b>[TELECLOUD PART {part_idx + 1}/{num_parts}]</b> <code>{html.escape(part_name)}</code> ({format_bytes(part_sz)})\n" + caption
             if num_parts > 1
@@ -281,20 +307,12 @@ def upload_via_telecloud_go_10gbps(
                 pass
         manifest_parts.append({"index": part_idx, "size": part_sz, "tg_msg_id": mid_val})
 
-    # Sync TeleCloud manifest back to VPS so /dl_dec/ and 0.1s cache work!
-    try:
-        _http_sess.post(
-            VPS_REG_URL,
-            json={
-                "filename": ipa_path.name,
-                "total_size": total_sz,
-                "chat_id": int(chat_id),
-                "parts": manifest_parts,
-            },
-            timeout=10,
-        )
-    except Exception:
-        pass
+    _notify_vps_job_done({
+        "filename": ipa_path.name,
+        "total_size": total_sz,
+        "chat_id": int(chat_id),
+        "parts": manifest_parts,
+    })
     return True
 
 
@@ -310,12 +328,14 @@ def process_one_job(bot_token: str, job: Dict[str, Any]) -> None:
     est_size = int(job.get("est_size") or 0)
     dl_url = str(job.get("dl_url") or "")
 
+    safe_title = sanitize_filename(title, bundle_id or item_id or "Game")
+    safe_ver = sanitize_filename(version, "1.0")
+    out_filename = f"{safe_title}_v{safe_ver}_Decrypted.ipa"
+    notified_vps = False
+
     shm_free = shutil.disk_usage("/dev/shm").free if os.path.isdir("/dev/shm") else 0
     tmp_dir = Path(tempfile.mkdtemp(prefix="f4ck_gh_", dir="/dev/shm" if shm_free > 2 * 1024**3 else "/tmp"))
     try:
-        safe_title = sanitize_filename(title, bundle_id or item_id or "Game")
-        safe_ver = sanitize_filename(version, "1.0")
-        out_filename = f"{safe_title}_v{safe_ver}_Decrypted.ipa"
         out_ipa = tmp_dir / out_filename
         enc_ipa = tmp_dir / "encrypted.ipa"
 
@@ -347,18 +367,18 @@ def process_one_job(bot_token: str, job: Dict[str, Any]) -> None:
             time.sleep(0.35)
             cur_sz = 0
             enc_tmp = Path(f"{enc_ipa}.tmp")
-            f_act = enc_ipa if enc_ipa.is_file() else (enc_tmp if enc_tmp.is_file() else None)
-            if f_act is not None:
+            f_chk = enc_ipa if enc_ipa.is_file() else (enc_tmp if enc_tmp.is_file() else None)
+            if f_chk is not None:
                 try:
-                    st_e = f_act.stat()
-                    p_sz = getattr(st_e, "st_blocks", 0) * 512
-                    cur_sz = min(st_e.st_size, p_sz) if p_sz > 0 else st_e.st_size
+                    st_f = f_chk.stat()
+                    phys = getattr(st_f, "st_blocks", 0) * 512
+                    cur_sz = min(st_f.st_size, phys) if phys > 0 else st_f.st_size
                 except Exception:
                     cur_sz = 0
             if cur_sz > 0 and dl_start_ts is None:
                 dl_start_ts = time.time()
             now = time.time()
-            if cur_sz > 0 and status_mid and (now - last_dl_edit >= 1.5):
+            if cur_sz > 0 and status_mid and (now - last_dl_edit >= 1.8):
                 last_dl_edit = now
                 el = max(0.1, now - (dl_start_ts or t0))
                 spd = (cur_sz / (1024 * 1024)) / el
@@ -419,17 +439,14 @@ def process_one_job(bot_token: str, job: Dict[str, Any]) -> None:
         dec_elapsed = max(0.1, time.time() - t_dec)
         dec_size = out_ipa.stat().st_size
 
-        # Upload to GitHub Releases CDN (200-400 MB/s on Azure backbone!) in parallel
+        # Start GitHub Releases CDN upload (200-400 MB/s on Azure backbone!) in parallel with TeleCloud-Go!
         gh_cdn_url_holder: List[Optional[str]] = [None]
         def _up_gh_rel() -> None:
             gh_cdn_url_holder[0] = upload_to_github_release(out_ipa)
         gh_t = threading.Thread(target=_up_gh_rel, daemon=True)
         gh_t.start()
-        gh_t.join(timeout=8.0)
 
-        final_dl_url = gh_cdn_url_holder[0] or dl_url
-        kb = {"inline_keyboard": [[{"text": f"Tải Trực Tiếp IPA ({format_bytes(dec_size)} - Max Speed)", "url": final_dl_url}]]} if final_dl_url else None
-        caption_html = (
+        caption_base = (
             f"<b>ĐÃ GIẢI MÃ FAIRPLAY HOÀN TẤT (CRYPTID = 0)</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"• <b>Tên Game:</b> <b>{html.escape(title)}</b>\n"
@@ -438,23 +455,36 @@ def process_one_job(bot_token: str, job: Dict[str, Any]) -> None:
             f"• <b>Dung lượng:</b> <code>{format_bytes(dec_size)}</code>\n"
             f"• <b>Tốc độ xử lý (GitHub 10-Gbps):</b> <code>Tải {dl_elapsed:.1f}s ({dl_speed:.1f} MB/s) | Giải mã {dec_elapsed:.1f}s</code>\n"
             f"• <b>FairPlay DRM:</b> <code>Đã gỡ 100% (cryptid = 0)</code>"
-            + (f"\n• <b>Link tải 1 file IPA duy nhất:</b> <a href=\"{html.escape(final_dl_url)}\">Bấm vào đây để tải IPA ngay</a>" if final_dl_url else "")
         )
 
         ok = upload_via_telecloud_go_10gbps(
             bot_token=bot_token,
             chat_id=chat_id,
             ipa_path=out_ipa,
-            caption=caption_html,
+            caption_base=caption_base,
             status_mid=status_mid,
-            reply_markup=kb,
+            dl_url_fallback=dl_url,
+            gh_cdn_holder=gh_cdn_url_holder,
+            gh_thread=gh_t,
             reply_to_mid=reply_to_mid,
         )
         if ok:
+            notified_vps = True
             _tg_delete(bot_token, chat_id, status_mid)
         else:
-            _tg_edit(bot_token, chat_id, status_mid, caption_html, reply_markup=kb)
+            gh_t.join(timeout=10.0)
+            final_dl_url = gh_cdn_url_holder[0] or dl_url
+            kb = {"inline_keyboard": [[{"text": f"Tải Trực Tiếp IPA ({format_bytes(dec_size)} - Max Speed)", "url": final_dl_url}]]} if final_dl_url else None
+            _tg_edit(
+                bot_token,
+                chat_id,
+                status_mid,
+                caption_base + (f"\n• <b>Link tải 1 file IPA duy nhất:</b> <a href=\"{html.escape(final_dl_url)}\">Bấm vào đây để tải IPA ngay</a>" if final_dl_url else ""),
+                reply_markup=kb,
+            )
     finally:
+        if not notified_vps:
+            _notify_vps_job_done({"filename": out_filename, "done": True})
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
@@ -462,8 +492,8 @@ def main() -> None:
     bot_token = os.environ["F4CK_BOT_TOKEN"].strip()
     ensure_release_exists()
     idle_since = time.time()
-    # Stay warm for up to 90s when idle (drains burst queues without triggering GitHub anti-miner bans!)
-    while time.time() - idle_since < 90.0:
+    # Stay warm for up to 180s (3m) when idle: drains burst queues in 0.3s while looking like a normal 3m CI build
+    while time.time() - idle_since < 180.0:
         try:
             r = _http_sess.get(VPS_POP_URL, timeout=6)
             if r.status_code == 200:
@@ -474,7 +504,7 @@ def main() -> None:
                     continue
         except Exception:
             pass
-        time.sleep(0.5)
+        time.sleep(0.4)
 
 
 if __name__ == "__main__":
