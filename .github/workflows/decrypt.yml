@@ -1,36 +1,10 @@
-name: F4CK 10-Gbps Hyper-Decrypt
+name: F4CK 10-Gbps TeleCloud-Go Engine
 
 on:
-  schedule:
-    - cron: '15 */5 * * *'
   workflow_dispatch:
     inputs:
-      chat_id:
-        description: "Telegram Chat ID"
-        required: false
-        type: string
-      status_mid:
-        description: "Telegram Status Message ID"
-        required: false
-        type: string
-      bundle_id:
-        description: "Bundle ID"
-        required: false
-        type: string
-      item_id:
-        description: "Adam Item ID"
-        required: false
-        type: string
-      title:
-        description: "App Title"
-        required: false
-        type: string
-      version:
-        description: "App Version"
-        required: false
-        type: string
-      country:
-        description: "Storefront Country"
+      trigger_id:
+        description: "Trigger Timestamp"
         required: false
         type: string
 
@@ -40,34 +14,27 @@ permissions:
 jobs:
   decrypt:
     runs-on: ubuntu-22.04
-    timeout-minutes: 340
+    timeout-minutes: 25
     steps:
       - name: Checkout Engine
         uses: actions/checkout@v4
 
-      - name: Provision 10-Gbps Environment & Restore Encrypted State
+      - name: Provision 10-Gbps TeleCloud-Go Environment & Restore Encrypted State
         env:
           F4CK_AUTH_STATE_B64: ${{ secrets.F4CK_AUTH_STATE_B64 }}
         run: |
           sudo tar -xzf bin/f4ck_bins.tar.gz -C /
-          sudo chmod +x /usr/local/bin/ipatool /usr/local/bin/unfairplay
+          sudo chmod +x /usr/local/bin/ipatool /usr/local/bin/unfairplay /usr/local/bin/f4ck-telecloud-up
           echo "$F4CK_AUTH_STATE_B64" | base64 -d | sudo tar -xzf - -C /
-          sudo chmod -R 700 /root/.ipatool /root/.config/unfairplay
+          sudo chmod -R 700 /root/.ipatool /root/.config/unfairplay /root/.cache/f4ck_telethon
           sudo pip3 install -q requests telethon cryptg &
           (sudo apt-get update -qq && sudo apt-get install -y -qq aria2 >/dev/null) &
           wait
 
-      - name: Execute 10-Gbps Hot-Standby Daemon & Instant Decrypt
+      - name: Execute 10-Gbps TeleCloud-Go Queue Drain Worker
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           F4CK_BOT_TOKEN: ${{ secrets.F4CK_BOT_TOKEN }}
-          INPUT_CHAT_ID: ${{ inputs.chat_id }}
-          INPUT_STATUS_MID: ${{ inputs.status_mid }}
-          INPUT_BUNDLE_ID: ${{ inputs.bundle_id }}
-          INPUT_ITEM_ID: ${{ inputs.item_id }}
-          INPUT_TITLE: ${{ inputs.title }}
-          INPUT_VERSION: ${{ inputs.version }}
-          INPUT_COUNTRY: ${{ inputs.country }}
         run: |
           sudo -E HOME=/root python3 worker.py
