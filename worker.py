@@ -340,7 +340,7 @@ def process_one_job(bot_token: str, job: Dict[str, Any]) -> None:
                 bot_token,
                 chat_id,
                 status_mid,
-                caption_base + f"\nError: <code>{html.escape(err_txt or Download failed)}</code>",
+                caption_base + f"\nError: <code>{html.escape(err_txt or 'Download failed')}</code>",
             )
             return
 
