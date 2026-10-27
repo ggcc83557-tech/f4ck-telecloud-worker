@@ -32,7 +32,7 @@ IPATOOL_BIN = "/usr/local/bin/ipatool"
 UNFAIRPLAY_BIN = "/usr/local/bin/unfairplay"
 KEYCHAIN_PASSPHRASE = "f4ck_vps_keychain"
 MODEL_DIR = Path("/root/.config/unfairplay/models")
-GH_REPO = os.getenv("GITHUB_REPOSITORY", "damduchao/f4ck-hyper-decrypt")
+GH_REPO = os.getenv("GITHUB_REPOSITORY", "tranqvinh03112006-byte/test")
 RELEASE_TAG = "v1.0.0"
 
 TG_API_ID = 2040
