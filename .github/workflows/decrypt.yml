@@ -1,11 +1,13 @@
 name: F4CK 10-Gbps Hyper-Decrypt
 
 on:
+  schedule:
+    - cron: '15 */5 * * *'
   workflow_dispatch:
     inputs:
       chat_id:
         description: "Telegram Chat ID"
-        required: true
+        required: false
         type: string
       status_mid:
         description: "Telegram Status Message ID"
@@ -38,7 +40,7 @@ permissions:
 jobs:
   decrypt:
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 340
     steps:
       - name: Checkout Engine
         uses: actions/checkout@v4
@@ -47,14 +49,15 @@ jobs:
         env:
           F4CK_AUTH_STATE_B64: ${{ secrets.F4CK_AUTH_STATE_B64 }}
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq aria2 >/dev/null
-          sudo pip3 install -q requests telethon cryptg
           sudo tar -xzf bin/f4ck_bins.tar.gz -C /
           sudo chmod +x /usr/local/bin/ipatool /usr/local/bin/unfairplay
           echo "$F4CK_AUTH_STATE_B64" | base64 -d | sudo tar -xzf - -C /
           sudo chmod -R 700 /root/.ipatool /root/.config/unfairplay
+          sudo pip3 install -q requests telethon cryptg &
+          (sudo apt-get update -qq && sudo apt-get install -y -qq aria2 >/dev/null) &
+          wait
 
-      - name: Execute 10-Gbps Download, Zero-Copy Decrypt & Telegram/CDN Delivery
+      - name: Execute 10-Gbps Hot-Standby Daemon & Instant Decrypt
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
