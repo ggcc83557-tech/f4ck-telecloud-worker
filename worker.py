@@ -423,6 +423,14 @@ def try_download_from_34306_cloud(
                     if res_list and res_list[0].get("is_cached"):
                         target_reg = reg_cand
                         break
+            if not target_reg:
+                r_q = c_sess.get(f"{base_url}/api/v1/cache", params={"q": bundle_id}, timeout=8)
+                if r_q.status_code == 200:
+                    items = (r_q.json() or {}).get("items") or []
+                    for it in items:
+                        if isinstance(it, dict) and str(it.get("bundle_id") or "").lower() == bundle_id.lower():
+                            target_reg = str(it.get("region") or pref_reg).lower()
+                            break
 
         if not target_reg:
             return False
@@ -686,7 +694,7 @@ def process_one_job(bot_token: str, job: Dict[str, Any]) -> None:
                 caption_base=caption_base,
             )
 
-        homes = [] if (downloaded_ok or cloud_reg_pre) else get_ordered_ipatool_homes(country)
+        homes = [] if (downloaded_ok or cloud_reg_pre or not job.get("allow_gh_ipatool")) else get_ordered_ipatool_homes(country)
         for acc_cc, home_dir in homes:
             try:
                 enc_ipa.unlink(missing_ok=True)
@@ -714,6 +722,7 @@ def process_one_job(bot_token: str, job: Dict[str, Any]) -> None:
             env = os.environ.copy()
             env["HOME"] = home_dir
             env["F4CK_COUNTRY_HINT"] = country
+            env["F4CK_NO_AUTO_LOGIN"] = "1"
             env["F4CK_FAST_DOWNLOAD"] = "1"
             env["F4CK_FAST_DECRYPT"] = "1"
             env["TMPDIR"] = str(tmp_dir)
