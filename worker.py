@@ -386,6 +386,8 @@ def try_download_from_34306_cloud(
     chat_id: int,
     status_mid: Optional[int],
     caption_base: str,
+    pre_region: str = "",
+    pre_version: str = "",
 ) -> bool:
     if not bundle_id:
         return False
@@ -398,44 +400,44 @@ def try_download_from_34306_cloud(
         if not hp_cookie:
             return False
 
-        r_cv = c_sess.get(f"{base_url}/api/v1/cached-versions", params={"bundle_id": bundle_id}, timeout=10)
-        versions = []
-        if r_cv.status_code == 200:
-            data = r_cv.json()
-            versions = data.get("versions", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        target_reg = (pre_region or "").strip().lower()
+        target_ver = (pre_version or "").strip()
+        if not target_reg:
+            r_cv = c_sess.get(f"{base_url}/api/v1/cached-versions", params={"bundle_id": bundle_id}, timeout=10)
+            versions = []
+            if r_cv.status_code == 200:
+                data = r_cv.json()
+                versions = data.get("versions", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
 
-        target_reg = ""
-        pref_reg = (country_hint or "us").strip().lower()
-        if pref_reg not in ("vn", "us", "cn", "jp"):
-            pref_reg = "us"
+            pref_reg = (country_hint or "us").strip().lower()
+            if pref_reg not in ("vn", "us", "cn", "jp"):
+                pref_reg = "us"
 
-        if versions:
-            target_reg = str(versions[0].get("region") or pref_reg).lower()
-            for v in versions:
-                if str(v.get("region") or "").lower() == pref_reg:
-                    target_reg = pref_reg
-                    break
-        else:
-            for reg_cand in [pref_reg, "us", "cn", "jp", "vn"]:
-                r_lk = c_sess.get(f"{base_url}/api/v1/lookup", params={"id": bundle_id, "region": reg_cand, "platform": "iphone"}, timeout=8)
-                if r_lk.status_code == 200:
-                    res_list = (r_lk.json() or {}).get("results") or []
-                    if res_list and res_list[0].get("is_cached"):
-                        target_reg = reg_cand
+            if versions:
+                target_reg = str(versions[0].get("region") or pref_reg).lower()
+                target_ver = str(versions[0].get("version") or target_ver)
+                for v in versions:
+                    if str(v.get("region") or "").lower() == pref_reg:
+                        target_reg = pref_reg
+                        target_ver = str(v.get("version") or target_ver)
                         break
-            if not target_reg:
+            else:
                 r_q = c_sess.get(f"{base_url}/api/v1/cache", params={"q": bundle_id}, timeout=8)
                 if r_q.status_code == 200:
-                    items = (r_q.json() or {}).get("items") or []
+                    q_json = r_q.json() or {}
+                    items = q_json.get("cache") or q_json.get("items") or []
                     for it in items:
                         if isinstance(it, dict) and str(it.get("bundle_id") or "").lower() == bundle_id.lower():
                             target_reg = str(it.get("region") or pref_reg).lower()
+                            target_ver = str(it.get("version") or target_ver)
                             break
 
         if not target_reg:
             return False
 
         dl_url = f"{base_url}/api/v1/download/{bundle_id}?region={target_reg}"
+        if target_ver:
+            dl_url += f"&version={target_ver}"
         with c_sess.get(dl_url, stream=True, timeout=600) as resp:
             if resp.status_code not in (200, 206):
                 return False
@@ -680,6 +682,7 @@ def process_one_job(bot_token: str, job: Dict[str, Any]) -> None:
         cdn_url_pre = str(job.get("cdn_url") or "")
         sinfs_pre = job.get("sinfs") or []
         cloud_reg_pre = str(job.get("cloud_34306_region") or "")
+        cloud_ver_pre = str(job.get("cloud_34306_version") or "")
 
         downloaded_ok = False
         err_txt = ""
@@ -791,7 +794,7 @@ def process_one_job(bot_token: str, job: Dict[str, Any]) -> None:
                 return
         else:
             # Cross-Region Cloud Fallback on 10-Gbps worker (decrypt.34306.lol multi-region cache)
-            if not try_download_from_34306_cloud(bundle_id, country, out_ipa, bot_token, chat_id, status_mid, caption_base):
+            if not try_download_from_34306_cloud(bundle_id, country, out_ipa, bot_token, chat_id, status_mid, caption_base, pre_region=cloud_reg_pre, pre_version=cloud_ver_pre):
                 _notify_vps_job_done({
                     "filename": out_filename,
                     "fallback_needed": True,
