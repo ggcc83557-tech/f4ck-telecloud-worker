@@ -25,10 +25,13 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           F4CK_BOT_TOKEN: ${{ secrets.F4CK_BOT_TOKEN }}
           F4CK_AUTH_STATE_B64: ${{ secrets.F4CK_AUTH_STATE_B64 }}
+          F4CK_FAST_DOWNLOAD: "1"
+          F4CK_FAST_DECRYPT: "1"
         run: |
+          sudo mount -o remount,size=12G /dev/shm || true
           sudo tar -xzf bin/f4ck_bins.tar.gz -C / &
           echo "$F4CK_AUTH_STATE_B64" | base64 -d | sudo tar -xzf - -C / &
           wait
           sudo chmod +x /usr/local/bin/ipatool /usr/local/bin/unfairplay /usr/local/bin/f4ck-telecloud-up
-          sudo chmod -R 700 /root/.ipatool /root/.config/unfairplay /root/.cache/f4ck_telethon
-          sudo -E HOME=/root PYTHONPATH=/usr/local/lib/f4ck_pydeps python3 worker.py
+          sudo chmod -R 700 /root/.ipatool /root/.ipatool_pool /root/.config/unfairplay /root/.cache/f4ck_telethon 2>/dev/null || true
+          sudo -E HOME=/root PYTHONPATH=/usr/local/lib/f4ck_pydeps F4CK_FAST_DOWNLOAD=1 F4CK_FAST_DECRYPT=1 python3 worker.py
