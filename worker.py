@@ -193,26 +193,189 @@ def _has_premium_4gb_pool() -> bool:
 
 
 def get_ordered_ipatool_homes(preferred_country: str = "") -> List[Tuple[str, str]]:
+    import hashlib
     pref = (preferred_country or "").strip().upper()
     homes: List[Tuple[str, str]] = []
     seen_dirs = set()
+    seen_hashes = set()
 
     def _add(cc_label: str, home_path: str) -> None:
         p = str(home_path)
-        if p not in seen_dirs and os.path.isfile(os.path.join(p, ".ipatool", "account")):
-            seen_dirs.add(p)
-            homes.append((cc_label.upper(), p))
+        acc_p = os.path.join(p, ".ipatool", "account")
+        if p in seen_dirs or not os.path.isfile(acc_p):
+            return
+        seen_dirs.add(p)
+        try:
+            with open(acc_p, "rb") as f_acc:
+                h = hashlib.sha256(f_acc.read()).hexdigest()
+        except Exception:
+            h = p
+        if h in seen_hashes:
+            return
+        seen_hashes.add(h)
+        homes.append((cc_label.upper(), p))
 
     if pref and IPATOOL_POOL_DIR.is_dir():
         _add(pref, str(IPATOOL_POOL_DIR / pref))
     if IPATOOL_POOL_DIR.is_dir():
         _add("VN", str(IPATOOL_POOL_DIR / "VN"))
-    _add("DEFAULT", "/root")
-    if IPATOOL_POOL_DIR.is_dir():
         for child in sorted(IPATOOL_POOL_DIR.iterdir()):
             if child.is_dir():
                 _add(child.name, str(child))
+    _add("DEFAULT", "/root")
     return homes
+
+
+def _write_sinf_sidecar_from_meta(enc_ipa: Path, sinfs_list: list) -> bool:
+    import plistlib
+    import zipfile
+    if not sinfs_list or not enc_ipa.is_file():
+        return False
+    try:
+        with zipfile.ZipFile(enc_ipa, "r") as zf:
+            names = zf.namelist()
+            bundle_name = ""
+            info_data = None
+            manifest_data = None
+            for name in names:
+                if ".app/Info.plist" in name and "/Watch/" not in name:
+                    parts = name.split(".app/Info.plist")[0].split("/")
+                    bundle_name = parts[-1]
+                    if info_data is None:
+                        info_data = plistlib.loads(zf.read(name))
+                    break
+            if not bundle_name:
+                return False
+            manifest_member = f"Payload/{bundle_name}.app/SC_Info/Manifest.plist"
+            if manifest_member in names:
+                manifest_data = plistlib.loads(zf.read(manifest_member))
+            else:
+                for name in names:
+                    if name.endswith(".app/SC_Info/Manifest.plist"):
+                        manifest_data = plistlib.loads(zf.read(name))
+                        break
+            sinf_map: Dict[str, str] = {}
+            sinf_paths = (manifest_data or {}).get("SinfPaths") or []
+            if sinf_paths:
+                for s_item, sp in zip(sinfs_list, sinf_paths):
+                    b64_data = (s_item.get("Data") or s_item.get("sinf")) if isinstance(s_item, dict) else None
+                    if b64_data:
+                        sinf_map[f"Payload/{bundle_name}.app/{sp}"] = str(b64_data)
+            elif info_data and info_data.get("CFBundleExecutable"):
+                exe = info_data["CFBundleExecutable"]
+                b64_data = (sinfs_list[0].get("Data") or sinfs_list[0].get("sinf")) if isinstance(sinfs_list[0], dict) else None
+                if b64_data:
+                    sinf_map[f"Payload/{bundle_name}.app/SC_Info/{exe}.sinf"] = str(b64_data)
+            if sinf_map:
+                Path(f"{enc_ipa}.sinfs.json").write_text(json.dumps(sinf_map), encoding="utf-8")
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _fast_download_cdn_10gbps(
+    cdn_url: str,
+    dest_ipa: Path,
+    sinfs_list: list,
+    bot_token: str,
+    chat_id: int,
+    status_mid: Optional[int],
+    caption_base: str,
+) -> bool:
+    from concurrent.futures import ThreadPoolExecutor
+    tmp_path = Path(f"{dest_ipa}.tmp")
+    tmp_path.unlink(missing_ok=True)
+    try:
+        head_r = _http_sess.get(cdn_url, headers={"Range": "bytes=0-0"}, stream=True, timeout=15)
+        cr = head_r.headers.get("Content-Range") or ""
+        head_r.close()
+        total_sz = 0
+        if "/" in cr:
+            try:
+                total_sz = int(cr.split("/")[-1].strip())
+            except Exception:
+                total_sz = 0
+        if total_sz <= 0:
+            with _http_sess.get(cdn_url, stream=True, timeout=180) as r_full:
+                if r_full.status_code not in (200, 206):
+                    return False
+                with open(tmp_path, "wb") as f_out:
+                    for chunk in r_full.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f_out.write(chunk)
+        else:
+            fd = os.open(str(tmp_path), os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
+            os.ftruncate(fd, total_sz)
+            num_streams = 32 if total_sz >= 16 * 1024 * 1024 else 8
+            part_sz = (total_sz + num_streams - 1) // num_streams
+            dl_lock = threading.Lock()
+            dl_bytes = [0]
+            t_start = time.time()
+            last_edit = [0.0]
+
+            def _dl_range(idx: int) -> bool:
+                start_b = idx * part_sz
+                end_b = min(total_sz - 1, start_b + part_sz - 1)
+                if start_b > end_b:
+                    return True
+                for attempt in range(4):
+                    cur_off = start_b
+                    try:
+                        with requests.get(
+                            cdn_url,
+                            headers={"Range": f"bytes={cur_off}-{end_b}"},
+                            stream=True,
+                            timeout=30,
+                        ) as r_part:
+                            if r_part.status_code not in (200, 206):
+                                continue
+                            for chunk in r_part.iter_content(chunk_size=512 * 1024):
+                                if not chunk:
+                                    continue
+                                os.pwrite(fd, chunk, cur_off)
+                                cur_off += len(chunk)
+                                with dl_lock:
+                                    dl_bytes[0] += len(chunk)
+                                    now = time.time()
+                                    if status_mid and (now - last_edit[0] >= 1.5):
+                                        last_edit[0] = now
+                                        done_b = dl_bytes[0]
+                                        spd = (done_b / (1024 * 1024)) / max(0.1, now - t_start)
+                                        pct = min(99.9, done_b * 100.0 / total_sz)
+                                        threading.Thread(
+                                            target=_tg_edit,
+                                            args=(
+                                                bot_token,
+                                                chat_id,
+                                                status_mid,
+                                                caption_base + f"\nDownloading: <code>{pct:.0f}% ({spd:.1f} MB/s)</code>",
+                                            ),
+                                            daemon=True,
+                                        ).start()
+                        if cur_off > end_b:
+                            return True
+                    except Exception:
+                        time.sleep(0.2 * (attempt + 1))
+                return False
+
+            try:
+                with ThreadPoolExecutor(max_workers=num_streams) as ex:
+                    results = list(ex.map(_dl_range, range(num_streams)))
+            finally:
+                os.close(fd)
+            if not all(results):
+                tmp_path.unlink(missing_ok=True)
+                return False
+
+        if tmp_path.is_file() and tmp_path.stat().st_size > 100 * 1024:
+            tmp_path.replace(dest_ipa)
+            _write_sinf_sidecar_from_meta(dest_ipa, sinfs_list)
+            return True
+    except Exception:
+        pass
+    tmp_path.unlink(missing_ok=True)
+    return False
 
 
 def try_download_from_34306_cloud(
@@ -293,7 +456,12 @@ def try_download_from_34306_cloud(
                             ),
                             daemon=True,
                         ).start()
-        return out_ipa.is_file() and out_ipa.stat().st_size > 1024 * 100
+        if out_ipa.is_file() and out_ipa.stat().st_size > 1024 * 100:
+            with open(out_ipa, "rb") as f_chk:
+                if f_chk.read(4) == b"PK\x03\x04":
+                    return True
+            out_ipa.unlink(missing_ok=True)
+        return False
     except Exception:
         return False
 
@@ -501,12 +669,24 @@ def process_one_job(bot_token: str, job: Dict[str, Any]) -> None:
         out_ipa = tmp_dir / out_filename
         enc_ipa = tmp_dir / "encrypted.ipa"
 
-        homes = get_ordered_ipatool_homes(country)
-        if not homes:
-            homes = [("DEFAULT", "/root")]
+        cdn_url_pre = str(job.get("cdn_url") or "")
+        sinfs_pre = job.get("sinfs") or []
+        cloud_reg_pre = str(job.get("cloud_34306_region") or "")
 
         downloaded_ok = False
         err_txt = ""
+        if cdn_url_pre and sinfs_pre:
+            downloaded_ok = _fast_download_cdn_10gbps(
+                cdn_url=cdn_url_pre,
+                dest_ipa=enc_ipa,
+                sinfs_list=list(sinfs_pre),
+                bot_token=bot_token,
+                chat_id=chat_id,
+                status_mid=status_mid,
+                caption_base=caption_base,
+            )
+
+        homes = [] if (downloaded_ok or cloud_reg_pre) else get_ordered_ipatool_homes(country)
         for acc_cc, home_dir in homes:
             try:
                 enc_ipa.unlink(missing_ok=True)
