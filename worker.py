@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-F4CK CHEAT — GitHub Actions 10-Gbps + TeleCloud-Go Multi-TCP Work-Stealing Worker
-- Multi-Region Asspp Keychain Pool (/root/.ipatool_pool/<CC>/.ipatool) + Single-Account Dynamic Multi-Country Storefront Switch
-- 32-Stream Parallel HTTP Range Download into 12GB /dev/shm RAM Disk
-- 54 TCP Connections x 6 Workers (324 concurrent 512KB chunks = 162MB in-flight BDP window)
+F4CK CHEAT — GitHub Actions 10-Gbps Zero-Wait CDN + TeleCloud-Go Worker
+- Stage 1: Native Go 32-Stream Lock-Free Apple CDN Download into 14GB /dev/shm RAM Disk (200-600+ MB/s)
+- Stage 2: RAM-Disk UnfairPlay Decrypt (F4CK_FAST_DECRYPT=1)
+- Stage 3: Native Go Multi-Stream 10-Gbps Upload to GitHub Releases / Fastly 100-Gbps CDN (150-350+ MB/s)
+- Stage 4: Instant Zero-Wait Delivery + Queue Unblock
+- Stage 5: Non-Blocking Background Native Telegram .IPA Upgrade (<= 2.0 GB)
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ sys.path.insert(0, "/usr/local/lib/f4ck_pydeps")
 
 import asyncio
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import html
 import json
 import os
@@ -25,7 +28,6 @@ import subprocess
 import tempfile
 import threading
 import time
-import urllib.parse
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -40,18 +42,16 @@ MODEL_DIR = Path("/root/.config/unfairplay/models")
 GOTD_POOL_DIR = Path("/root/.cache/f4ck_telethon/gotd_pool")
 GOTD_PREMIUM_POOL_DIR = Path("/root/.cache/f4ck_telethon/gotd_premium")
 PREMIUM_TELETHON_SESSION = Path("/root/.cache/f4ck_telethon/premium_user.session")
-VAULT_STORAGE_CHAT_ID = -1003882219288
 
-GH_REPO = os.getenv("GITHUB_REPOSITORY", "")
-RELEASE_TAG = "v1.0.0"
-VPS_BASE = "https://160-191-242-70.sslip.io"
-DL_SECRET = "f4ck_unfairplay_dl_secret_2026"
+GH_REPO = os.getenv("GITHUB_REPOSITORY", "").strip()
+VPS_BASE = os.getenv("F4CK_VPS_BASE", "https://160-191-242-70.sslip.io").rstrip("/")
+DL_SECRET = os.getenv("F4CK_DEC_DL_SECRET", "f4ck_unfairplay_dl_secret_2026")
 VPS_POP_URL = f"{VPS_BASE}/dl_dec/gh_warm_pop/{DL_SECRET}/__gh_next_job__.json"
+VPS_REG_POST_URL = f"{VPS_BASE}/dl_dec/telecloud_reg/{DL_SECRET}/__post__"
 
-# Bot limit: 3,996 chunks * 512 KB = 2,095,054,848 bytes (~2.00 GB)
+# Bot single-document limit: 3,996 chunks * 512 KB = 2,095,054,848 bytes (~2.00 GB)
 MAX_BOT_PART_SIZE = 3996 * 512 * 1024
-# Telegram Premium limit: 7,992 chunks * 512 KB = 4,190,109,696 bytes (~4.00 GB)
-MAX_PREMIUM_PART_SIZE = 7992 * 512 * 1024
+WARM_IDLE_SECONDS = 240.0
 
 TG_API_ID = 2040
 TG_API_HASH = "b18441a1ff607e10a989891a5462e627"
@@ -61,6 +61,8 @@ _http_sess = requests.Session()
 _adapter = requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=64)
 _http_sess.mount("https://", _adapter)
 _http_sess.mount("http://", _adapter)
+
+_bg_executor = ThreadPoolExecutor(max_workers=1)
 
 
 def strip_ansi(text: str) -> str:
@@ -84,8 +86,14 @@ def sanitize_filename(name: str, fallback: str = "Game") -> str:
 
 def _notify_vps_job_done(payload: Dict[str, Any]) -> None:
     try:
+        r = _http_sess.post(VPS_REG_POST_URL, json=payload, timeout=12)
+        if r.status_code == 200:
+            return
+    except Exception:
+        pass
+    try:
         b64 = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).decode("ascii").rstrip("=")
-        _http_sess.get(f"{VPS_BASE}/dl_dec/telecloud_reg/{DL_SECRET}/{b64}", timeout=10)
+        _http_sess.get(f"{VPS_BASE}/dl_dec/telecloud_reg/{DL_SECRET}/{b64}", timeout=12)
     except Exception:
         pass
 
@@ -105,36 +113,11 @@ def _tg_send(
     }
     if reply_to_mid:
         payload["reply_to_message_id"] = int(reply_to_mid)
+        payload["allow_sending_without_reply"] = True
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
         r = _http_sess.post(f"https://api.telegram.org/bot{bot_token}/sendMessage", json=payload, timeout=10).json()
-        if r.get("ok"):
-            return int(r["result"]["message_id"])
-    except Exception:
-        pass
-    return None
-
-
-def _tg_copy_message(
-    bot_token: str,
-    from_chat_id: Any,
-    message_id: int,
-    to_chat_id: Any,
-    caption: str,
-    reply_to_mid: Optional[int] = None,
-) -> Optional[int]:
-    payload: Dict[str, Any] = {
-        "chat_id": to_chat_id,
-        "from_chat_id": from_chat_id,
-        "message_id": int(message_id),
-        "caption": caption,
-        "parse_mode": "HTML",
-    }
-    if reply_to_mid:
-        payload["reply_to_message_id"] = int(reply_to_mid)
-    try:
-        r = _http_sess.post(f"https://api.telegram.org/bot{bot_token}/copyMessage", json=payload, timeout=15).json()
         if r.get("ok"):
             return int(r["result"]["message_id"])
     except Exception:
@@ -182,48 +165,6 @@ def _load_session_authkey(session_path: Path) -> Optional[Tuple[int, str, int, b
     if row and row[3] and len(row[3]) == 256:
         return (int(row[0]), str(row[1]), int(row[2]), bytes(row[3]))
     return None
-
-
-def _has_premium_4gb_pool() -> bool:
-    return (
-        (GOTD_PREMIUM_POOL_DIR / "session_0.json").is_file()
-        and PREMIUM_TELETHON_SESSION.is_file()
-        and _load_session_authkey(PREMIUM_TELETHON_SESSION) is not None
-    )
-
-
-def get_ordered_ipatool_homes(preferred_country: str = "") -> List[Tuple[str, str]]:
-    import hashlib
-    pref = (preferred_country or "").strip().upper()
-    homes: List[Tuple[str, str]] = []
-    seen_dirs = set()
-    seen_hashes = set()
-
-    def _add(cc_label: str, home_path: str) -> None:
-        p = str(home_path)
-        acc_p = os.path.join(p, ".ipatool", "account")
-        if p in seen_dirs or not os.path.isfile(acc_p):
-            return
-        seen_dirs.add(p)
-        try:
-            with open(acc_p, "rb") as f_acc:
-                h = hashlib.sha256(f_acc.read()).hexdigest()
-        except Exception:
-            h = p
-        if h in seen_hashes:
-            return
-        seen_hashes.add(h)
-        homes.append((cc_label.upper(), p))
-
-    if pref and IPATOOL_POOL_DIR.is_dir():
-        _add(pref, str(IPATOOL_POOL_DIR / pref))
-    if IPATOOL_POOL_DIR.is_dir():
-        _add("VN", str(IPATOOL_POOL_DIR / "VN"))
-        for child in sorted(IPATOOL_POOL_DIR.iterdir()):
-            if child.is_dir():
-                _add(child.name, str(child))
-    _add("DEFAULT", "/root")
-    return homes
 
 
 def _write_sinf_sidecar_from_meta(enc_ipa: Path, sinfs_list: list) -> bool:
@@ -274,7 +215,7 @@ def _write_sinf_sidecar_from_meta(enc_ipa: Path, sinfs_list: list) -> bool:
     return False
 
 
-def _fast_download_cdn_10gbps(
+def download_cdn_via_go_10gbps(
     cdn_url: str,
     dest_ipa: Path,
     sinfs_list: list,
@@ -282,208 +223,204 @@ def _fast_download_cdn_10gbps(
     chat_id: int,
     status_mid: Optional[int],
     caption_base: str,
+    acc_cc: str = "VN",
 ) -> bool:
-    from concurrent.futures import ThreadPoolExecutor
-    tmp_path = Path(f"{dest_ipa}.tmp")
-    tmp_path.unlink(missing_ok=True)
-    try:
-        head_r = _http_sess.get(cdn_url, headers={"Range": "bytes=0-0"}, stream=True, timeout=15)
-        cr = head_r.headers.get("Content-Range") or ""
-        head_r.close()
-        total_sz = 0
-        if "/" in cr:
-            try:
-                total_sz = int(cr.split("/")[-1].strip())
-            except Exception:
-                total_sz = 0
-        if total_sz <= 0:
-            with _http_sess.get(cdn_url, stream=True, timeout=180) as r_full:
-                if r_full.status_code not in (200, 206):
-                    return False
-                with open(tmp_path, "wb") as f_out:
-                    for chunk in r_full.iter_content(chunk_size=1024 * 1024):
-                        if chunk:
-                            f_out.write(chunk)
-        else:
-            fd = os.open(str(tmp_path), os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
-            os.ftruncate(fd, total_sz)
-            num_streams = 32 if total_sz >= 16 * 1024 * 1024 else 8
-            part_sz = (total_sz + num_streams - 1) // num_streams
-            dl_lock = threading.Lock()
-            dl_bytes = [0]
-            t_start = time.time()
-            last_edit = [0.0]
+    if not os.path.isfile(TELECLOUD_UP_BIN):
+        return False
+    dest_ipa.unlink(missing_ok=True)
+    Path(f"{dest_ipa}.tmp").unlink(missing_ok=True)
 
-            def _dl_range(idx: int) -> bool:
-                start_b = idx * part_sz
-                end_b = min(total_sz - 1, start_b + part_sz - 1)
-                if start_b > end_b:
-                    return True
-                for attempt in range(4):
-                    cur_off = start_b
+    t0 = time.time()
+    last_edit = t0
+    proc = subprocess.Popen(
+        [
+            TELECLOUD_UP_BIN,
+            "--mode",
+            "dl",
+            "--url",
+            cdn_url,
+            "--file",
+            str(dest_ipa),
+            "--streams",
+            "32",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    if proc.stdout:
+        for line in proc.stdout:
+            s_line = line.strip()
+            if s_line.startswith("PROGRESS "):
+                parts = s_line.split()
+                if len(parts) >= 3:
                     try:
-                        with requests.get(
-                            cdn_url,
-                            headers={"Range": f"bytes={cur_off}-{end_b}"},
-                            stream=True,
-                            timeout=30,
-                        ) as r_part:
-                            if r_part.status_code not in (200, 206):
-                                continue
-                            for chunk in r_part.iter_content(chunk_size=512 * 1024):
-                                if not chunk:
-                                    continue
-                                os.pwrite(fd, chunk, cur_off)
-                                cur_off += len(chunk)
-                                with dl_lock:
-                                    dl_bytes[0] += len(chunk)
-                                    now = time.time()
-                                    if status_mid and (now - last_edit[0] >= 1.5):
-                                        last_edit[0] = now
-                                        done_b = dl_bytes[0]
-                                        spd = (done_b / (1024 * 1024)) / max(0.1, now - t_start)
-                                        pct = min(99.9, done_b * 100.0 / total_sz)
-                                        threading.Thread(
-                                            target=_tg_edit,
-                                            args=(
-                                                bot_token,
-                                                chat_id,
-                                                status_mid,
-                                                caption_base + f"\nDownloading: <code>{pct:.0f}% ({spd:.1f} MB/s)</code>",
-                                            ),
-                                            daemon=True,
-                                        ).start()
-                        if cur_off > end_b:
-                            return True
+                        done_b = int(parts[1])
+                        tot_b = int(parts[2])
                     except Exception:
-                        time.sleep(0.2 * (attempt + 1))
-                return False
+                        continue
+                    now = time.time()
+                    if done_b > 0 and status_mid and (now - last_edit >= 1.2):
+                        last_edit = now
+                        spd = (done_b / (1024 * 1024)) / max(0.08, now - t0)
+                        pct_s = f"{min(99.9, done_b * 100.0 / tot_b):.0f}% " if tot_b > 0 else f"{format_bytes(done_b)} "
+                        threading.Thread(
+                            target=_tg_edit,
+                            args=(
+                                bot_token,
+                                chat_id,
+                                status_mid,
+                                caption_base + f"\nDownloading ({html.escape(acc_cc)}): <code>{pct_s}({spd:.1f} MB/s)</code>",
+                            ),
+                            daemon=True,
+                        ).start()
 
-            try:
-                with ThreadPoolExecutor(max_workers=num_streams) as ex:
-                    results = list(ex.map(_dl_range, range(num_streams)))
-            finally:
-                os.close(fd)
-            if not all(results):
-                tmp_path.unlink(missing_ok=True)
-                return False
-
-        if tmp_path.is_file() and tmp_path.stat().st_size > 100 * 1024:
-            tmp_path.replace(dest_ipa)
-            _write_sinf_sidecar_from_meta(dest_ipa, sinfs_list)
-            return True
-    except Exception:
-        pass
-    tmp_path.unlink(missing_ok=True)
+    proc.wait(timeout=900)
+    if proc.returncode == 0 and dest_ipa.is_file() and dest_ipa.stat().st_size > 100 * 1024:
+        _write_sinf_sidecar_from_meta(dest_ipa, sinfs_list)
+        return True
+    dest_ipa.unlink(missing_ok=True)
+    Path(f"{dest_ipa}.tmp").unlink(missing_ok=True)
     return False
 
 
-def upload_via_telecloud_go_10gbps(
+def upload_via_gh_releases_10gbps(
     bot_token: str,
     chat_id: int,
     ipa_path: Path,
     caption_base: str,
     status_mid: Optional[int],
-    reply_to_mid: Optional[int],
-    dl_url: str = "",
-) -> bool:
-    from telethon import TelegramClient
-    from telethon.crypto import AuthKey
-    from telethon.network import ConnectionTcpAbridged
-    from telethon.sessions import MemorySession
-    from telethon.tl.types import DocumentAttributeFilename, InputFileBig
-
+    reply_markup: Optional[dict] = None,
+    streams: int = 0,
+) -> Optional[Dict[str, Any]]:
+    if not os.path.isfile(TELECLOUD_UP_BIN) or not GH_REPO:
+        return None
     total_sz = ipa_path.stat().st_size
-    chunk_size = 512 * 1024
+    cmd = [
+        TELECLOUD_UP_BIN,
+        "--mode",
+        "gh",
+        "--file",
+        str(ipa_path),
+        "--repo",
+        GH_REPO,
+        "--tag",
+        "auto",
+        "--name",
+        ipa_path.name,
+    ]
+    if streams > 0:
+        cmd.extend(["--streams", str(streams)])
 
-    use_premium_4gb = total_sz > MAX_BOT_PART_SIZE and _has_premium_4gb_pool()
-    if use_premium_4gb:
-        active_pool_dir = GOTD_PREMIUM_POOL_DIR
-        ak_row = _load_session_authkey(PREMIUM_TELETHON_SESSION)
-        max_part_sz = MAX_PREMIUM_PART_SIZE
-        conns_per_key = "8"
-        workers_per_conn = "6"
-    else:
-        active_pool_dir = GOTD_POOL_DIR
-        ak_row = _load_session_authkey(Path("/root/.cache/f4ck_telethon/pool/worker_0.session"))
-        max_part_sz = MAX_BOT_PART_SIZE
-        conns_per_key = "6"
-        workers_per_conn = "6"
-
-    if not ak_row or not os.path.isfile(TELECLOUD_UP_BIN):
-        return False
-
-    num_parts = max(1, (total_sz + max_part_sz - 1) // max_part_sz)
-    manifest_parts: List[Dict[str, Any]] = []
-    sent_bytes_completed = 0
-    start_ts = time.time()
-
-    target_storage_chat = int(chat_id) if (num_parts == 1 and not use_premium_4gb) else VAULT_STORAGE_CHAT_ID
-
-    for part_idx in range(num_parts):
-        part_offset = part_idx * max_part_sz
-        part_sz = min(max_part_sz, total_sz - part_offset)
-        part_chunks = (part_sz + chunk_size - 1) // chunk_size
-        file_id = secrets.randbits(63)
-        part_name = ipa_path.name if num_parts == 1 else f"{ipa_path.name}.part{part_idx + 1}"
-
-        proc = subprocess.Popen(
-            [
-                TELECLOUD_UP_BIN,
-                "--pool",
-                str(active_pool_dir),
-                "--file",
-                str(ipa_path),
-                "--offset",
-                str(part_offset),
-                "--size",
-                str(part_sz),
-                "--file-id",
-                str(file_id),
-                "--conns",
-                conns_per_key,
-                "--workers",
-                workers_per_conn,
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-        last_edit = time.time()
-        if proc.stdout:
-            for line in proc.stdout:
-                s_line = line.strip()
-                if s_line.startswith("PROGRESS "):
+    t0 = time.time()
+    last_edit = 0.0
+    gh_mf: Optional[Dict[str, Any]] = None
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    if proc.stdout:
+        for line in proc.stdout:
+            s_line = line.strip()
+            if s_line.startswith("PROGRESS "):
+                parts = s_line.split()
+                if len(parts) >= 3:
                     try:
-                        cur_part_bytes = int(s_line.split()[1])
+                        sent_b = int(parts[1])
+                        tot_b = int(parts[2]) or total_sz
                     except Exception:
                         continue
                     now = time.time()
-                    if status_mid and (now - last_edit >= 1.5):
+                    if sent_b > 0 and status_mid and (now - last_edit >= 1.1):
                         last_edit = now
-                        cur_total = sent_bytes_completed + cur_part_bytes
-                        elapsed = max(0.1, now - start_ts)
-                        speed_mb = (cur_total / (1024 * 1024)) / elapsed
-                        pct = min(99.9, (cur_total * 100.0 / total_sz) if total_sz > 0 else 0.0)
-                        msg_txt = (
-                            caption_base
-                            + f"\nUploading: <code>{pct:.0f}% ({speed_mb:.1f} MB/s)</code>"
-                        )
+                        spd = (sent_b / (1024 * 1024)) / max(0.08, now - t0)
+                        pct = min(99.9, (sent_b * 100.0 / tot_b) if tot_b > 0 else 0.0)
                         threading.Thread(
                             target=_tg_edit,
-                            args=(bot_token, chat_id, status_mid, msg_txt, None),
+                            args=(
+                                bot_token,
+                                chat_id,
+                                status_mid,
+                                caption_base + f"\nUploading: <code>{pct:.0f}% ({spd:.1f} MB/s)</code>",
+                                reply_markup,
+                            ),
                             daemon=True,
                         ).start()
+            elif s_line.startswith("GH_MANIFEST "):
+                try:
+                    gh_mf = json.loads(s_line[len("GH_MANIFEST "):])
+                except Exception:
+                    gh_mf = None
 
-        proc.wait(timeout=1200)
+    _, err_out = proc.communicate(timeout=900)
+    if proc.returncode != 0 or not gh_mf or not gh_mf.get("parts"):
+        sys.stderr.write(f"[gh-upload-err] rc={proc.returncode} err={err_out}\n")
+        return None
+    el = max(0.05, time.time() - t0)
+    print(f"[gh-10gbps] Uploaded {ipa_path.name} ({total_sz / (1024*1024):.1f} MB) in {el:.2f}s = {(total_sz/(1024*1024))/el:.1f} MB/s")
+    return gh_mf
+
+
+def _bg_telegram_native_upgrade(
+    bot_token: str,
+    chat_id: int,
+    staged_ipa: Path,
+    out_filename: str,
+    caption_base: str,
+    reply_to_mid: Optional[int],
+    reply_markup: Optional[dict],
+    temp_card_mid: Optional[int],
+) -> None:
+    try:
+        from telethon import TelegramClient
+        from telethon.crypto import AuthKey
+        from telethon.network import ConnectionTcpAbridged
+        from telethon.sessions import MemorySession
+        from telethon.tl.types import DocumentAttributeFilename, InputFileBig
+
+        ak_row = _load_session_authkey(Path("/root/.cache/f4ck_telethon/pool/worker_0.session"))
+        if not ak_row or not os.path.isfile(TELECLOUD_UP_BIN) or not staged_ipa.is_file():
+            return
+
+        total_sz = staged_ipa.stat().st_size
+        if total_sz <= 0 or total_sz > MAX_BOT_PART_SIZE:
+            return
+        chunk_size = 512 * 1024
+        part_chunks = (total_sz + chunk_size - 1) // chunk_size
+        file_id = secrets.randbits(63)
+
+        proc = subprocess.run(
+            [
+                TELECLOUD_UP_BIN,
+                "--mode",
+                "tg",
+                "--pool",
+                str(GOTD_POOL_DIR),
+                "--file",
+                str(staged_ipa),
+                "--offset",
+                "0",
+                "--size",
+                str(total_sz),
+                "--file-id",
+                str(file_id),
+                "--conns",
+                "1",
+                "--workers",
+                "3",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=1200,
+        )
         if proc.returncode != 0:
-            return False
-        sent_bytes_completed += part_sz
+            return
 
-        part_caption = f"Part {part_idx + 1}/{num_parts}\n" + caption_base if num_parts > 1 else caption_base
-
-        async def _finalize_msg(dest_chat: int) -> int:
+        async def _finalize_doc() -> int:
             dc_id, srv_ip, srv_port, ak_bytes = ak_row
             ms = MemorySession()
             ms.set_dc(dc_id, srv_ip, srv_port)
@@ -491,65 +428,261 @@ def upload_via_telecloud_go_10gbps(
             c = TelegramClient(ms, TG_API_ID, TG_API_HASH, receive_updates=False, connection=ConnectionTcpAbridged)
             await c.connect()
             try:
-                inp = InputFileBig(file_id, part_chunks, part_name)
+                inp = InputFileBig(file_id, part_chunks, out_filename)
                 try:
                     sent = await c.send_file(
-                        int(dest_chat),
+                        int(chat_id),
                         file=inp,
-                        caption=part_caption,
+                        caption=caption_base,
                         parse_mode="html",
                         force_document=True,
-                        attributes=[DocumentAttributeFilename(file_name=part_name)],
-                        reply_to=int(reply_to_mid) if (reply_to_mid and dest_chat == int(chat_id)) else None,
+                        attributes=[DocumentAttributeFilename(file_name=out_filename)],
+                        reply_to=int(reply_to_mid) if reply_to_mid else None,
                     )
                 except Exception:
                     sent = await c.send_file(
-                        int(dest_chat),
+                        int(chat_id),
                         file=inp,
-                        caption=part_caption,
+                        caption=caption_base,
                         parse_mode="html",
                         force_document=True,
-                        attributes=[DocumentAttributeFilename(file_name=part_name)],
+                        attributes=[DocumentAttributeFilename(file_name=out_filename)],
                     )
                 return int(getattr(sent, "id", 0) or 0)
             finally:
                 await c.disconnect()
 
+        mid_val = asyncio.run(_finalize_doc())
+        if mid_val > 0:
+            if reply_markup:
+                try:
+                    _http_sess.post(
+                        f"https://api.telegram.org/bot{bot_token}/editMessageReplyMarkup",
+                        json={"chat_id": chat_id, "message_id": mid_val, "reply_markup": reply_markup},
+                        timeout=8,
+                    )
+                except Exception:
+                    pass
+            if temp_card_mid:
+                _tg_delete(bot_token, chat_id, temp_card_mid)
+            _notify_vps_job_done({
+                "filename": out_filename,
+                "total_size": total_sz,
+                "chat_id": int(chat_id),
+                "parts": [{"index": 0, "size": total_sz, "tg_msg_id": mid_val}],
+                "bg_archive_only": True,
+            })
+    except Exception as exc:
+        sys.stderr.write(f"[bg-tg-upgrade] {exc}\n")
+    finally:
         try:
-            mid_val = asyncio.run(_finalize_msg(target_storage_chat))
+            staged_ipa.unlink(missing_ok=True)
         except Exception:
-            if target_storage_chat != int(chat_id):
-                target_storage_chat = int(chat_id)
-                mid_val = asyncio.run(_finalize_msg(target_storage_chat))
-            else:
-                raise
-        manifest_parts.append({"index": part_idx, "size": part_sz, "tg_msg_id": mid_val})
+            pass
 
+
+def upload_via_telecloud_go_fallback(
+    bot_token: str,
+    chat_id: int,
+    ipa_path: Path,
+    caption_base: str,
+    status_mid: Optional[int],
+    reply_to_mid: Optional[int],
+    reply_markup: Optional[dict],
+) -> bool:
+    """Emergency fallback if GitHub Releases CDN is ever unreachable."""
+    from telethon import TelegramClient
+    from telethon.crypto import AuthKey
+    from telethon.network import ConnectionTcpAbridged
+    from telethon.sessions import MemorySession
+    from telethon.tl.types import DocumentAttributeFilename, InputFileBig
+
+    ak_row = _load_session_authkey(Path("/root/.cache/f4ck_telethon/pool/worker_0.session"))
+    if not ak_row or not os.path.isfile(TELECLOUD_UP_BIN):
+        return False
+
+    total_sz = ipa_path.stat().st_size
+    if total_sz > MAX_BOT_PART_SIZE:
+        return False
+    chunk_size = 512 * 1024
+    part_chunks = (total_sz + chunk_size - 1) // chunk_size
+    file_id = secrets.randbits(63)
+    start_ts = time.time()
+    last_edit = start_ts
+
+    proc = subprocess.Popen(
+        [
+            TELECLOUD_UP_BIN,
+            "--mode",
+            "tg",
+            "--pool",
+            str(GOTD_POOL_DIR),
+            "--file",
+            str(ipa_path),
+            "--offset",
+            "0",
+            "--size",
+            str(total_sz),
+            "--file-id",
+            str(file_id),
+            "--conns",
+            "1",
+            "--workers",
+            "3",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    if proc.stdout:
+        for line in proc.stdout:
+            s_line = line.strip()
+            if s_line.startswith("PROGRESS "):
+                try:
+                    cur_b = int(s_line.split()[1])
+                except Exception:
+                    continue
+                now = time.time()
+                if status_mid and (now - last_edit >= 1.5):
+                    last_edit = now
+                    spd = (cur_b / (1024 * 1024)) / max(0.1, now - start_ts)
+                    pct = min(99.9, cur_b * 100.0 / total_sz)
+                    threading.Thread(
+                        target=_tg_edit,
+                        args=(
+                            bot_token,
+                            chat_id,
+                            status_mid,
+                            caption_base + f"\nUploading: <code>{pct:.0f}% ({spd:.1f} MB/s)</code>",
+                            reply_markup,
+                        ),
+                        daemon=True,
+                    ).start()
+
+    proc.wait(timeout=1200)
+    if proc.returncode != 0:
+        return False
+
+    async def _finalize() -> int:
+        dc_id, srv_ip, srv_port, ak_bytes = ak_row
+        ms = MemorySession()
+        ms.set_dc(dc_id, srv_ip, srv_port)
+        ms.auth_key = AuthKey(data=ak_bytes)
+        c = TelegramClient(ms, TG_API_ID, TG_API_HASH, receive_updates=False, connection=ConnectionTcpAbridged)
+        await c.connect()
+        try:
+            inp = InputFileBig(file_id, part_chunks, ipa_path.name)
+            sent = await c.send_file(
+                int(chat_id),
+                file=inp,
+                caption=caption_base,
+                parse_mode="html",
+                force_document=True,
+                attributes=[DocumentAttributeFilename(file_name=ipa_path.name)],
+                reply_to=int(reply_to_mid) if reply_to_mid else None,
+            )
+            return int(getattr(sent, "id", 0) or 0)
+        finally:
+            await c.disconnect()
+
+    mid_val = asyncio.run(_finalize())
+    if mid_val > 0 and reply_markup:
+        try:
+            _http_sess.post(
+                f"https://api.telegram.org/bot{bot_token}/editMessageReplyMarkup",
+                json={"chat_id": chat_id, "message_id": mid_val, "reply_markup": reply_markup},
+                timeout=8,
+            )
+        except Exception:
+            pass
     _notify_vps_job_done({
         "filename": ipa_path.name,
         "total_size": total_sz,
-        "chat_id": int(target_storage_chat),
-        "parts": manifest_parts,
+        "chat_id": int(chat_id),
+        "parts": [{"index": 0, "size": total_sz, "tg_msg_id": mid_val}],
     })
-
-    if use_premium_4gb and num_parts == 1 and manifest_parts:
-        vault_mid = int(manifest_parts[0]["tg_msg_id"])
-        if vault_mid > 0 and int(target_storage_chat) != int(chat_id):
-            _tg_copy_message(bot_token, target_storage_chat, vault_mid, chat_id, caption_base, reply_to_mid=reply_to_mid)
-        return True
-
-    if num_parts > 1 and dl_url:
-        kb = {
-            "inline_keyboard": [
-                [{"text": f"Tải 1 File .IPA Nguyên Bản ({format_bytes(total_sz)})", "url": dl_url}]
-            ]
-        }
-        _tg_send(bot_token, chat_id, caption_base, reply_to_mid=reply_to_mid, reply_markup=kb)
-
     return True
 
 
+def _run_bench_job(job: Dict[str, Any]) -> None:
+    """Zero-Telegram live 10-Gbps NIC benchmark on GitHub Actions runner."""
+    size_mb = int(job.get("size_mb") or 512)
+    stream_counts = job.get("stream_counts") or [1, 4, 6]
+    bench_name = str(job.get("filename") or "__gh_10gbps_bench__.bin")
+    results: Dict[str, Any] = {}
+    base_dir = "/dev/shm" if os.path.isdir("/dev/shm") else "/tmp"
+    test_file = Path(base_dir) / f"bench_{secrets.token_hex(4)}.bin"
+    try:
+        with open(test_file, "wb") as f_out:
+            chunk = os.urandom(4 * 1024 * 1024)
+            rem = size_mb * 1024 * 1024
+            while rem > 0:
+                w = min(len(chunk), rem)
+                f_out.write(chunk[:w])
+                rem -= w
+        tok = (os.getenv("GH_TOKEN") or os.getenv("F4CK_GH_TOKEN") or "").strip()
+        for sc in stream_counts:
+            t0 = time.time()
+            p = subprocess.run(
+                [
+                    TELECLOUD_UP_BIN,
+                    "--mode",
+                    "gh",
+                    "--file",
+                    str(test_file),
+                    "--repo",
+                    GH_REPO,
+                    "--tag",
+                    "v1.0.0",
+                    "--name",
+                    f"__bench_s{sc}.bin",
+                    "--streams",
+                    str(sc),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            dt = max(0.05, time.time() - t0)
+            mbps = size_mb / dt
+            print(f"[BENCH] size={size_mb}MB streams={sc} elapsed={dt:.2f}s speed={mbps:.1f} MB/s rc={p.returncode}")
+            results[str(sc)] = {"elapsed_s": round(dt, 3), "speed_mbs": round(mbps, 2), "rc": p.returncode}
+            for ln in (p.stdout or "").splitlines():
+                if ln.startswith("GH_MANIFEST "):
+                    try:
+                        mf = json.loads(ln[len("GH_MANIFEST "):])
+                        for pt in mf.get("parts") or []:
+                            aid = pt.get("asset_id")
+                            if aid and tok:
+                                _http_sess.delete(
+                                    f"https://api.github.com/repos/{GH_REPO}/releases/assets/{aid}",
+                                    headers={"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json"},
+                                    timeout=10,
+                                )
+                    except Exception:
+                        pass
+    finally:
+        test_file.unlink(missing_ok=True)
+        _notify_vps_job_done({"filename": bench_name, "bench_results": results, "done": True})
+
+
+def _choose_stage_dir(file_size: int) -> Path:
+    if os.path.isdir("/dev/shm") and shutil.disk_usage("/dev/shm").free > file_size + 4 * 1024**3:
+        d = Path("/dev/shm/f4ck_bg_stage")
+    elif os.path.isdir("/mnt") and shutil.disk_usage("/mnt").free > file_size + 4 * 1024**3:
+        d = Path("/mnt/f4ck_bg_stage")
+    else:
+        d = Path("/tmp/f4ck_bg_stage")
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def process_one_job(bot_token: str, job: Dict[str, Any]) -> None:
+    if job.get("bench_only"):
+        _run_bench_job(job)
+        return
+
     chat_id = int(job["chat_id"])
     status_mid = int(job["status_mid"]) if job.get("status_mid") else None
     reply_to_mid = int(job["reply_to_mid"]) if job.get("reply_to_mid") else None
@@ -558,8 +691,10 @@ def process_one_job(bot_token: str, job: Dict[str, Any]) -> None:
     title = str(job.get("title") or bundle_id or item_id or "Game")
     version = str(job.get("version") or "1.0")
     country = str(job.get("country") or "VN").upper()
+    acc_cc = str(job.get("acc_cc") or country).upper()
     est_size = int(job.get("est_size") or 0)
     dl_url = str(job.get("dl_url") or "")
+    gh_streams = int(job.get("gh_streams") or 0)
 
     safe_title = sanitize_filename(title, bundle_id or item_id or "Game")
     safe_ver = sanitize_filename(version, "1.0")
@@ -572,9 +707,9 @@ def process_one_job(bot_token: str, job: Dict[str, Any]) -> None:
     )
     notified_vps = False
 
-    # With 12GB /dev/shm remount, games up to 3.8 GB execute 100% in RAM disk!
+    # With 14GB /dev/shm remount on ubuntu-24.04, games up to 5.4 GB execute 100% in RAM disk!
     shm_free = shutil.disk_usage("/dev/shm").free if os.path.isdir("/dev/shm") else 0
-    use_shm = (0 < est_size < 3800 * 1024 * 1024) and (shm_free > int(est_size * 2.2))
+    use_shm = (0 <= est_size < 5400 * 1024 * 1024) and (shm_free > max(3 * 1024**3, int(est_size * 2.15)))
     base_tmp = "/dev/shm" if use_shm else ("/mnt" if os.path.isdir("/mnt") and shutil.disk_usage("/mnt").free > 12 * 1024**3 else "/tmp")
     tmp_dir = Path(tempfile.mkdtemp(prefix="f4ck_gh_", dir=base_tmp))
     try:
@@ -587,7 +722,7 @@ def process_one_job(bot_token: str, job: Dict[str, Any]) -> None:
         downloaded_ok = False
         err_txt = ""
         if cdn_url_pre and sinfs_pre:
-            downloaded_ok = _fast_download_cdn_10gbps(
+            downloaded_ok = download_cdn_via_go_10gbps(
                 cdn_url=cdn_url_pre,
                 dest_ipa=enc_ipa,
                 sinfs_list=list(sinfs_pre),
@@ -595,127 +730,150 @@ def process_one_job(bot_token: str, job: Dict[str, Any]) -> None:
                 chat_id=chat_id,
                 status_mid=status_mid,
                 caption_base=caption_base,
+                acc_cc=acc_cc,
             )
 
-        homes = [] if (downloaded_ok or not job.get("allow_gh_ipatool")) else get_ordered_ipatool_homes(country)
-        for acc_cc, home_dir in homes:
-            try:
-                enc_ipa.unlink(missing_ok=True)
-                Path(f"{enc_ipa}.tmp").unlink(missing_ok=True)
-            except Exception:
-                pass
-
-            dl_cmd = [
-                IPATOOL_BIN,
-                "download",
-                "--purchase",
-                "-o",
-                str(enc_ipa),
-                "--keychain-passphrase",
-                KEYCHAIN_PASSPHRASE,
-                "--non-interactive",
-                "--format",
-                "json",
-            ]
-            if item_id and item_id.isdigit():
-                dl_cmd.extend(["-i", item_id])
-            elif bundle_id:
-                dl_cmd.extend(["-b", bundle_id])
-
-            env = os.environ.copy()
-            env["HOME"] = home_dir
-            env["XDG_CACHE_HOME"] = "/root/.cache"
-            env["F4CK_COUNTRY_HINT"] = country
-            env["F4CK_FAST_KBSYNC"] = "1"
-            env["F4CK_FAST_DOWNLOAD"] = "1"
-            env["F4CK_FAST_DECRYPT"] = "1"
-            env["TMPDIR"] = str(tmp_dir)
-            t0 = time.time()
-            proc = subprocess.Popen(dl_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
-            last_dl_edit = time.time()
-            dl_start_ts = None
-
-            while proc.poll() is None:
-                time.sleep(0.35)
-                cur_sz = 0
-                enc_tmp = Path(f"{enc_ipa}.tmp")
-                f_chk = enc_ipa if enc_ipa.is_file() else (enc_tmp if enc_tmp.is_file() else None)
-                if f_chk is not None:
-                    try:
-                        st_f = f_chk.stat()
-                        phys = getattr(st_f, "st_blocks", 0) * 512
-                        cur_sz = min(st_f.st_size, phys) if phys > 0 else st_f.st_size
-                    except Exception:
-                        cur_sz = 0
-                if cur_sz > 0 and dl_start_ts is None:
-                    dl_start_ts = time.time()
-                now = time.time()
-                if cur_sz > 0 and status_mid and (now - last_dl_edit >= 1.5):
-                    last_dl_edit = now
-                    el = max(0.1, now - (dl_start_ts or t0))
-                    spd = (cur_sz / (1024 * 1024)) / el
-                    pct_val = min(99.9, cur_sz * 100.0 / est_size) if est_size > 0 else 0.0
-                    pct_s = f"{pct_val:.0f}% " if est_size > 0 else f"{format_bytes(cur_sz)} "
-                    threading.Thread(
-                        target=_tg_edit,
-                        args=(
-                            bot_token,
-                            chat_id,
-                            status_mid,
-                            caption_base + f"\nDownloading: <code>{pct_s}({spd:.1f} MB/s)</code>",
-                        ),
-                        daemon=True,
-                    ).start()
-
-            out_s, err_s = proc.communicate(timeout=15)
-            if proc.returncode == 0 and enc_ipa.is_file():
-                downloaded_ok = True
-                break
-            err_txt = strip_ansi(((out_s or "") + "\n" + (err_s or "")).strip())[-500:]
-
-        if downloaded_ok:
-            _tg_edit(
-                bot_token,
-                chat_id,
-                status_mid,
-                caption_base + "\nDecrypting...",
-            )
-            dec_env = os.environ.copy()
-            dec_env["F4CK_FAST_DECRYPT"] = "1"
-            dec_proc = subprocess.run(
-                [UNFAIRPLAY_BIN, "decrypt", "--model", str(MODEL_DIR), "--input", str(enc_ipa), "--output", str(out_ipa), "--force"],
-                capture_output=True,
-                text=True,
-                timeout=1200,
-                env=dec_env,
-            )
-            enc_ipa.unlink(missing_ok=True)
-            Path(f"{enc_ipa}.sinfs.json").unlink(missing_ok=True)
-            if dec_proc.returncode != 0 or not out_ipa.is_file():
-                return
-        else:
+        if not downloaded_ok:
             _notify_vps_job_done({
                 "filename": out_filename,
                 "fallback_needed": True,
-                "error": err_txt or "Download failed",
+                "error": err_txt or "CDN download failed on worker",
             })
             notified_vps = True
             return
 
-        ok = upload_via_telecloud_go_10gbps(
+        _tg_edit(
+            bot_token,
+            chat_id,
+            status_mid,
+            caption_base + "\nDecrypting...",
+        )
+        dec_env = os.environ.copy()
+        dec_env["F4CK_FAST_DECRYPT"] = "1"
+        dec_proc = subprocess.run(
+            [UNFAIRPLAY_BIN, "decrypt", "--model", str(MODEL_DIR), "--input", str(enc_ipa), "--output", str(out_ipa), "--force"],
+            capture_output=True,
+            text=True,
+            timeout=1200,
+            env=dec_env,
+        )
+        enc_ipa.unlink(missing_ok=True)
+        Path(f"{enc_ipa}.sinfs.json").unlink(missing_ok=True)
+        if dec_proc.returncode != 0 or not out_ipa.is_file():
+            dec_err = strip_ansi(((dec_proc.stdout or "") + "\n" + (dec_proc.stderr or "")).strip())[-400:]
+            _notify_vps_job_done({
+                "filename": out_filename,
+                "fallback_needed": True,
+                "error": dec_err or "Decrypt failed on worker",
+            })
+            notified_vps = True
+            return
+
+        dec_size = out_ipa.stat().st_size
+        sz_label = (
+            f"{dec_size / (1024 ** 3):.2f} GB"
+            if dec_size >= 1024 ** 3
+            else f"{dec_size / (1024 * 1024):.1f} MB"
+        )
+        kb = (
+            {"inline_keyboard": [[{"text": f"[Tải IPA ({sz_label}) — Max Speed]", "url": dl_url}]]}
+            if dl_url
+            else None
+        )
+
+        # Stage 3: 10-Gbps Upload to GitHub Releases / Fastly 100-Gbps CDN (150-350+ MB/s)
+        gh_mf = upload_via_gh_releases_10gbps(
+            bot_token=bot_token,
+            chat_id=chat_id,
+            ipa_path=out_ipa,
+            caption_base=caption_base,
+            status_mid=status_mid,
+            reply_markup=kb,
+            streams=gh_streams,
+        )
+
+        if gh_mf and gh_mf.get("parts"):
+            # Stage 4: Instant Zero-Wait Delivery & Queue Unblock!
+            _notify_vps_job_done({
+                "filename": out_filename,
+                "total_size": dec_size,
+                "gh_repo": gh_mf.get("repo") or GH_REPO,
+                "gh_tag": gh_mf.get("tag") or "v1.0.0",
+                "gh_release_id": gh_mf.get("release_id"),
+                "gh_parts": gh_mf["parts"],
+            })
+            notified_vps = True
+
+            # Fast-path for <= 19 MB: Telegram pulls directly from our 100-Gbps HTTPS URL!
+            if dec_size <= 19 * 1024 * 1024 and dl_url:
+                doc_payload: Dict[str, Any] = {
+                    "chat_id": chat_id,
+                    "document": dl_url,
+                    "caption": caption_base,
+                    "parse_mode": "HTML",
+                }
+                if kb:
+                    doc_payload["reply_markup"] = kb
+                if reply_to_mid:
+                    doc_payload["reply_to_message_id"] = int(reply_to_mid)
+                    doc_payload["allow_sending_without_reply"] = True
+                try:
+                    dr = _http_sess.post(
+                        f"https://api.telegram.org/bot{bot_token}/sendDocument",
+                        json=doc_payload,
+                        timeout=35,
+                    ).json()
+                    if dr.get("ok"):
+                        _tg_delete(bot_token, chat_id, status_mid)
+                        return
+                except Exception:
+                    pass
+
+            temp_card_mid = _tg_send(
+                bot_token,
+                chat_id,
+                caption_base,
+                reply_to_mid=reply_to_mid,
+                reply_markup=kb,
+            )
+            _tg_delete(bot_token, chat_id, status_mid)
+
+            # Stage 5: Non-Blocking Background Native Telegram .IPA Upgrade (<= 2.0 GB)
+            if dec_size <= MAX_BOT_PART_SIZE and not job.get("skip_bg_tg"):
+                stage_dir = _choose_stage_dir(dec_size)
+                staged_ipa = stage_dir / f"{int(time.time())}_{secrets.token_hex(3)}_{out_filename}"
+                try:
+                    shutil.move(str(out_ipa), str(staged_ipa))
+                    _bg_executor.submit(
+                        _bg_telegram_native_upgrade,
+                        bot_token,
+                        chat_id,
+                        staged_ipa,
+                        out_filename,
+                        caption_base,
+                        reply_to_mid,
+                        kb,
+                        temp_card_mid,
+                    )
+                except Exception:
+                    staged_ipa.unlink(missing_ok=True)
+            return
+
+        # Fallback if GitHub Releases CDN was unavailable
+        ok_fb = upload_via_telecloud_go_fallback(
             bot_token=bot_token,
             chat_id=chat_id,
             ipa_path=out_ipa,
             caption_base=caption_base,
             status_mid=status_mid,
             reply_to_mid=reply_to_mid,
-            dl_url=dl_url,
+            reply_markup=kb,
         )
-        if ok:
+        if ok_fb:
             notified_vps = True
             _tg_delete(bot_token, chat_id, status_mid)
         else:
-            _tg_edit(bot_token, chat_id, status_mid, caption_base)
+            _tg_edit(bot_token, chat_id, status_mid, caption_base, reply_markup=kb)
     finally:
         if not notified_vps:
             _notify_vps_job_done({"filename": out_filename, "done": True})
@@ -725,18 +883,21 @@ def process_one_job(bot_token: str, job: Dict[str, Any]) -> None:
 def main() -> None:
     bot_token = os.environ["F4CK_BOT_TOKEN"].strip()
     idle_since = time.time()
-    while time.time() - idle_since < 120.0:
-        try:
-            r = _http_sess.get(VPS_POP_URL, timeout=6)
-            if r.status_code == 200:
-                job_data = r.json()
-                if job_data and job_data.get("chat_id"):
-                    process_one_job(bot_token, job_data)
-                    idle_since = time.time()
-                    continue
-        except Exception:
-            pass
-        time.sleep(0.15)
+    try:
+        while time.time() - idle_since < WARM_IDLE_SECONDS:
+            try:
+                r = _http_sess.get(VPS_POP_URL, timeout=6)
+                if r.status_code == 200:
+                    job_data = r.json()
+                    if job_data and (job_data.get("chat_id") or job_data.get("bench_only")):
+                        process_one_job(bot_token, job_data)
+                        idle_since = time.time()
+                        continue
+            except Exception:
+                pass
+            time.sleep(0.15)
+    finally:
+        _bg_executor.shutdown(wait=True)
 
 
 if __name__ == "__main__":

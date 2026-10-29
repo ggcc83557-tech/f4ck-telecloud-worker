@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   decrypt:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout Engine
@@ -22,13 +22,14 @@ jobs:
       - name: Execute 10-Gbps TeleCloud-Go Queue Drain Worker
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          F4CK_GH_TOKEN: ${{ secrets.F4CK_GH_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           F4CK_BOT_TOKEN: ${{ secrets.F4CK_BOT_TOKEN }}
           F4CK_AUTH_STATE_B64: ${{ secrets.F4CK_AUTH_STATE_B64 }}
           F4CK_FAST_DOWNLOAD: "1"
           F4CK_FAST_DECRYPT: "1"
         run: |
-          sudo mount -o remount,size=12G /dev/shm || true
+          sudo mount -o remount,size=14G /dev/shm || true
           sudo tar -xzf bin/f4ck_bins.tar.gz -C / &
           echo "$F4CK_AUTH_STATE_B64" | base64 -d | sudo tar -xzf - -C / &
           wait
