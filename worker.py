@@ -724,8 +724,10 @@ def process_one_job(bot_token: str, job: Dict[str, Any]) -> None:
 
             env = os.environ.copy()
             env["HOME"] = home_dir
+            env["XDG_CACHE_HOME"] = "/root/.cache"
             env["F4CK_COUNTRY_HINT"] = country
             env["F4CK_NO_AUTO_LOGIN"] = "1"
+            env["F4CK_FAST_KBSYNC"] = "1"
             env["F4CK_FAST_DOWNLOAD"] = "1"
             env["F4CK_FAST_DECRYPT"] = "1"
             env["TMPDIR"] = str(tmp_dir)
