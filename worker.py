@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 F4CK CHEAT — GitHub Actions 10-Gbps + TeleCloud-Go Multi-TCP Work-Stealing Worker
-- Multi-Region Asspp Keychain Pool (/root/.ipatool_pool/<CC>/.ipatool) + 34306 Multi-Region Cloud Fallback
+- Multi-Region Asspp Keychain Pool (/root/.ipatool_pool/<CC>/.ipatool) + Single-Account Dynamic Multi-Country Storefront Switch
 - 32-Stream Parallel HTTP Range Download into 12GB /dev/shm RAM Disk
 - 54 TCP Connections x 6 Workers (324 concurrent 512KB chunks = 162MB in-flight BDP window)
 """
@@ -378,104 +378,6 @@ def _fast_download_cdn_10gbps(
     return False
 
 
-def try_download_from_34306_cloud(
-    bundle_id: str,
-    country_hint: str,
-    out_ipa: Path,
-    bot_token: str,
-    chat_id: int,
-    status_mid: Optional[int],
-    caption_base: str,
-    pre_region: str = "",
-    pre_version: str = "",
-) -> bool:
-    if not bundle_id:
-        return False
-    base_url = "https://decrypt.34306.lol"
-    try:
-        c_sess = requests.Session()
-        c_sess.headers.update({"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"})
-        r_hp = c_sess.post(f"{base_url}/api/v1/captcha/verify", json={"token": "1x00000000000000000000AA"}, timeout=10)
-        hp_cookie = r_hp.cookies.get("hp", "")
-        if not hp_cookie:
-            return False
-
-        target_reg = (pre_region or "").strip().lower()
-        target_ver = (pre_version or "").strip()
-        if not target_reg:
-            r_cv = c_sess.get(f"{base_url}/api/v1/cached-versions", params={"bundle_id": bundle_id}, timeout=10)
-            versions = []
-            if r_cv.status_code == 200:
-                data = r_cv.json()
-                versions = data.get("versions", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-
-            pref_reg = (country_hint or "us").strip().lower()
-            if pref_reg not in ("vn", "us", "cn", "jp"):
-                pref_reg = "us"
-
-            if versions:
-                target_reg = str(versions[0].get("region") or pref_reg).lower()
-                target_ver = str(versions[0].get("version") or target_ver)
-                for v in versions:
-                    if str(v.get("region") or "").lower() == pref_reg:
-                        target_reg = pref_reg
-                        target_ver = str(v.get("version") or target_ver)
-                        break
-            else:
-                r_q = c_sess.get(f"{base_url}/api/v1/cache", params={"q": bundle_id}, timeout=8)
-                if r_q.status_code == 200:
-                    q_json = r_q.json() or {}
-                    items = q_json.get("cache") or q_json.get("items") or []
-                    for it in items:
-                        if isinstance(it, dict) and str(it.get("bundle_id") or "").lower() == bundle_id.lower():
-                            target_reg = str(it.get("region") or pref_reg).lower()
-                            target_ver = str(it.get("version") or target_ver)
-                            break
-
-        if not target_reg:
-            return False
-
-        dl_url = f"{base_url}/api/v1/download/{bundle_id}?region={target_reg}"
-        if target_ver:
-            dl_url += f"&version={target_ver}"
-        with c_sess.get(dl_url, stream=True, timeout=600) as resp:
-            if resp.status_code not in (200, 206):
-                return False
-            total = int(resp.headers.get("Content-Length") or 0)
-            written = 0
-            last_edit = 0.0
-            t0 = time.time()
-            with open(out_ipa, "wb") as fp:
-                for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                    if not chunk:
-                        continue
-                    fp.write(chunk)
-                    written += len(chunk)
-                    now = time.time()
-                    if status_mid and (now - last_edit >= 1.5) and total > 0:
-                        last_edit = now
-                        pct = min(99.9, written * 100.0 / total)
-                        spd = (written / (1024 * 1024)) / max(0.1, now - t0)
-                        threading.Thread(
-                            target=_tg_edit,
-                            args=(
-                                bot_token,
-                                chat_id,
-                                status_mid,
-                                caption_base + f"\nDownloading ({target_reg.upper()} Cloud): <code>{pct:.0f}% ({spd:.1f} MB/s)</code>",
-                            ),
-                            daemon=True,
-                        ).start()
-        if out_ipa.is_file() and out_ipa.stat().st_size > 1024 * 100:
-            with open(out_ipa, "rb") as f_chk:
-                if f_chk.read(4) == b"PK\x03\x04":
-                    return True
-            out_ipa.unlink(missing_ok=True)
-        return False
-    except Exception:
-        return False
-
-
 def upload_via_telecloud_go_10gbps(
     bot_token: str,
     chat_id: int,
@@ -681,8 +583,6 @@ def process_one_job(bot_token: str, job: Dict[str, Any]) -> None:
 
         cdn_url_pre = str(job.get("cdn_url") or "")
         sinfs_pre = job.get("sinfs") or []
-        cloud_reg_pre = str(job.get("cloud_34306_region") or "")
-        cloud_ver_pre = str(job.get("cloud_34306_version") or "")
 
         downloaded_ok = False
         err_txt = ""
@@ -697,7 +597,7 @@ def process_one_job(bot_token: str, job: Dict[str, Any]) -> None:
                 caption_base=caption_base,
             )
 
-        homes = [] if (downloaded_ok or cloud_reg_pre or not job.get("allow_gh_ipatool")) else get_ordered_ipatool_homes(country)
+        homes = [] if (downloaded_ok or not job.get("allow_gh_ipatool")) else get_ordered_ipatool_homes(country)
         for acc_cc, home_dir in homes:
             try:
                 enc_ipa.unlink(missing_ok=True)
@@ -726,7 +626,6 @@ def process_one_job(bot_token: str, job: Dict[str, Any]) -> None:
             env["HOME"] = home_dir
             env["XDG_CACHE_HOME"] = "/root/.cache"
             env["F4CK_COUNTRY_HINT"] = country
-            env["F4CK_NO_AUTO_LOGIN"] = "1"
             env["F4CK_FAST_KBSYNC"] = "1"
             env["F4CK_FAST_DOWNLOAD"] = "1"
             env["F4CK_FAST_DECRYPT"] = "1"
@@ -795,15 +694,13 @@ def process_one_job(bot_token: str, job: Dict[str, Any]) -> None:
             if dec_proc.returncode != 0 or not out_ipa.is_file():
                 return
         else:
-            # Cross-Region Cloud Fallback on 10-Gbps worker (decrypt.34306.lol multi-region cache)
-            if not try_download_from_34306_cloud(bundle_id, country, out_ipa, bot_token, chat_id, status_mid, caption_base, pre_region=cloud_reg_pre, pre_version=cloud_ver_pre):
-                _notify_vps_job_done({
-                    "filename": out_filename,
-                    "fallback_needed": True,
-                    "error": err_txt or "Download failed",
-                })
-                notified_vps = True
-                return
+            _notify_vps_job_done({
+                "filename": out_filename,
+                "fallback_needed": True,
+                "error": err_txt or "Download failed",
+            })
+            notified_vps = True
+            return
 
         ok = upload_via_telecloud_go_10gbps(
             bot_token=bot_token,
