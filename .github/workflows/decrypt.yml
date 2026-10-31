@@ -1,0 +1,42 @@
+name: F4CK 10-Gbps TeleCloud-Go Engine
+
+on:
+  workflow_dispatch:
+    inputs:
+      trigger_id:
+        description: "Trigger Timestamp"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  decrypt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout Engine
+        uses: actions/checkout@v4
+
+      - name: Execute 10-Gbps TeleCloud-Go Queue Drain Worker
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          F4CK_GH_TOKEN: ${{ secrets.F4CK_GH_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          F4CK_BOT_TOKEN: ${{ secrets.F4CK_BOT_TOKEN }}
+          F4CK_AUTH_STATE_B64: ${{ secrets.F4CK_AUTH_STATE_B64 }}
+          F4CK_VPS_BASE: ${{ secrets.F4CK_VPS_BASE }}
+          F4CK_DEC_DL_SECRET: ${{ secrets.F4CK_DEC_DL_SECRET }}
+          F4CK_FAST_DOWNLOAD: "1"
+          F4CK_FAST_DECRYPT: "1"
+        run: |
+          sudo mount -o remount,size=14G /dev/shm || true
+          sudo sysctl -qw net.core.rmem_max=67108864 net.core.wmem_max=67108864 net.ipv4.tcp_rmem="4096 1048576 67108864" net.ipv4.tcp_wmem="4096 1048576 67108864" net.core.default_qdisc=fq net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
+          sudo tar -xzf bin/f4ck_bins.tar.gz -C / &
+          echo "$F4CK_AUTH_STATE_B64" | base64 -d | sudo tar -xzf - -C / &
+          wait
+          sudo chmod +x /usr/local/bin/unfairplay /usr/local/bin/f4ck-telecloud-up
+          [ -f /usr/local/bin/ipatool ] && sudo chmod +x /usr/local/bin/ipatool || true
+          sudo chmod -R 700 /root/.config/unfairplay /root/.cache/f4ck_telethon 2>/dev/null || true
+          sudo -E HOME=/root PYTHONPATH=/usr/local/lib/f4ck_pydeps F4CK_FAST_DOWNLOAD=1 F4CK_FAST_DECRYPT=1 python3 worker.py
